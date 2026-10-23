@@ -2,7 +2,7 @@
 Track OpenAI Chat Completions cost (from API usage) and wall-clock time per call.
 
 Cost uses official list prices where configured (per 1M input/output tokens, USD).
-Adjust MODEL_USD_PER_1M when OpenAI updates pricing, or use register_pricing() at runtime.
+Adjust _MODEL_USD_PER_1M when OpenAI updates pricing, or use register_pricing() at runtime.
 """
 
 from __future__ import annotations
@@ -12,12 +12,18 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 # USD per 1M input tokens, USD per 1M output tokens (standard, non-batch).
-# Source: https://platform.openai.com/docs/pricing (verify periodically).
+# Source: https://developers.openai.com/api/docs/pricing (checked 2026-10-23, verify periodically).
+# Models marked "retiring" are on https://developers.openai.com/api/docs/deprecations.
 _MODEL_USD_PER_1M: dict[str, tuple[float, float]] = {
-    "gpt-5-nano": (0.05, 0.40),
+    "gpt-6-luna": (0.10, 0.50),
+    "gpt-6.1-sol": (2.00, 10.00),
+    "gpt-6-astra": (10.00, 50.00),
+    "gpt-5.6-luna": (0.20, 1.20),
+    "gpt-5-nano": (0.05, 0.40),     # retiring 2026-12-11
+    "gpt-5-mini": (0.25, 2.00),     # retiring 2026-12-11
+    "gpt-4.1-mini": (0.40, 1.60),   # retiring 2027-01-14
     "gpt-4o": (2.50, 10.00),
-    "gpt-4o-mini": (0.15, 0.60),
-    "gpt-3.5-turbo": (0.50, 1.50),
+    "gpt-4o-mini": (0.15, 0.60),    # retiring 2027-01-14
 }
 
 _registered: dict[str, tuple[float, float]] = {}
@@ -34,12 +40,12 @@ def _resolve_pricing(model: str) -> Optional[tuple[float, float]]:
         return _registered[m]
     if m in _MODEL_USD_PER_1M:
         return _MODEL_USD_PER_1M[m]
-    for key, rates in _registered.items():
-        if m.startswith(key.lower()):
-            return rates
-    for key, rates in _MODEL_USD_PER_1M.items():
-        if m.startswith(key.lower()):
-            return rates
+    # The API returns dated snapshot names (e.g. "gpt-4o-mini-2024-07-18"), so match by prefix.
+    # Longest prefix first, otherwise "gpt-4o-mini-..." would be priced as "gpt-4o".
+    for table in (_registered, _MODEL_USD_PER_1M):
+        for key in sorted(table, key=len, reverse=True):
+            if m.startswith(key.lower()):
+                return table[key]
     return None
 
 
@@ -68,6 +74,7 @@ class CallMetric:
     output_tokens: int
     cost_usd: Optional[float]
     elapsed_s: float
+    reasoning_tokens: int = 0  # hidden reasoning, already included in output_tokens (and billed)
 
 
 @dataclass
@@ -121,8 +128,8 @@ class OpenAIMetricsSession:
             for i, c in enumerate(self.calls, 1):
                 cost = f"${c.cost_usd:.6f}" if c.cost_usd is not None else "n/a"
                 lines.append(
-                    f"  #{i} {c.model} | in={c.input_tokens} out={c.output_tokens} | "
-                    f"cost~{cost} | {c.elapsed_s:.3f}s"
+                    f"  #{i} {c.model} | in={c.input_tokens} out={c.output_tokens} "
+                    f"(reasoning={c.reasoning_tokens}) | cost~{cost} | {c.elapsed_s:.3f}s"
                 )
         return "\n".join(lines)
 
@@ -167,8 +174,26 @@ def chat_completions_create_with_metrics(
     and optionally appends a CallMetric to `session`.
     Returns the ChatCompletion response (same as the API).
     """
+    return _call_with_metrics(client.chat.completions.create, session, **kwargs)
+
+
+def chat_completions_parse_with_metrics(
+    client: Any,
+    *,
+    session: Optional[OpenAIMetricsSession] = None,
+    **kwargs: Any,
+) -> Any:
+    """
+    Same as :func:`chat_completions_create_with_metrics`, but calls client.chat.completions.parse(**kwargs).
+    Pass a Pydantic model as `response_format=` (Structured Outputs); the parsed object is in
+    response.choices[0].message.parsed.
+    """
+    return _call_with_metrics(client.chat.completions.parse, session, **kwargs)
+
+
+def _call_with_metrics(api_method: Any, session: Optional[OpenAIMetricsSession], **kwargs: Any) -> Any:
     t0 = time.perf_counter()
-    response = client.chat.completions.create(**kwargs)
+    response = api_method(**kwargs)
     elapsed = time.perf_counter() - t0
 
     usage = getattr(response, "usage", None)
@@ -178,6 +203,8 @@ def chat_completions_create_with_metrics(
     model = getattr(response, "model", None) or kwargs.get("model") or "unknown"
     in_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
     out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning_tok = int(getattr(details, "reasoning_tokens", 0) or 0)
     cost = estimate_call_cost_usd(str(model), input_tokens=in_tok, output_tokens=out_tok)
     metric = CallMetric(
         model=str(model),
@@ -185,6 +212,7 @@ def chat_completions_create_with_metrics(
         output_tokens=out_tok,
         cost_usd=cost,
         elapsed_s=elapsed,
+        reasoning_tokens=reasoning_tok,
     )
     if session is not None:
         session.add(metric)
