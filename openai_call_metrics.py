@@ -191,16 +191,35 @@ def chat_completions_parse_with_metrics(
     return _call_with_metrics(client.chat.completions.parse, session, **kwargs)
 
 
+async def achat_completions_parse_with_metrics(
+    async_client: Any,
+    *,
+    session: Optional[OpenAIMetricsSession] = None,
+    **kwargs: Any,
+) -> Any:
+    """
+    Async version of :func:`chat_completions_parse_with_metrics` for an ``AsyncOpenAI`` client:
+    ``response = await achat_completions_parse_with_metrics(async_client, session=..., ...)``.
+    """
+    t0 = time.perf_counter()
+    response = await async_client.chat.completions.parse(**kwargs)
+    _record_metrics(response, time.perf_counter() - t0, session, kwargs.get("model"))
+    return response
+
+
 def _call_with_metrics(api_method: Any, session: Optional[OpenAIMetricsSession], **kwargs: Any) -> Any:
     t0 = time.perf_counter()
     response = api_method(**kwargs)
-    elapsed = time.perf_counter() - t0
+    _record_metrics(response, time.perf_counter() - t0, session, kwargs.get("model"))
+    return response
 
+
+def _record_metrics(response: Any, elapsed: float, session: Optional[OpenAIMetricsSession], requested_model: Any) -> None:
     usage = getattr(response, "usage", None)
     if usage is None:
         raise ValueError("API response has no .usage; cannot compute tokens/cost (avoid stream-only without usage).")
 
-    model = getattr(response, "model", None) or kwargs.get("model") or "unknown"
+    model = getattr(response, "model", None) or requested_model or "unknown"
     in_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
     out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
     details = getattr(usage, "completion_tokens_details", None)
@@ -216,4 +235,3 @@ def _call_with_metrics(api_method: Any, session: Optional[OpenAIMetricsSession],
     )
     if session is not None:
         session.add(metric)
-    return response
